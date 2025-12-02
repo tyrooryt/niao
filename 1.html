@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI 移动端识别系统</title>
+    <style>
+        body {
+            margin: 0; padding: 0;
+            background-color: #000;
+            color: #00ff41;
+            font-family: monospace;
+            overflow: hidden; /* 禁止滚动 */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+        }
+
+        /* 视频容器：保持比例或铺满 */
+        #container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            background: #000;
+        }
+
+        video {
+            position: absolute;
+            min-width: 100%;
+            min-height: 100%;
+            width: auto;
+            height: auto;
+            object-fit: cover; /* 铺满屏幕 */
+        }
+
+        canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            object-fit: cover;
+        }
+
+        /* HUD 界面 */
+        #hud {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 20;
+            pointer-events: none;
+        }
+
+        .status-bar {
+            position: absolute;
+            top: 20px; left: 20px;
+            background: rgba(0,0,0,0.6);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            border-left: 3px solid #00ff41;
+        }
+
+        .indicators {
+            position: absolute;
+            bottom: 40px; 
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .tag {
+            background: rgba(0,0,0,0.8);
+            border: 1px solid #555;
+            color: #888;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 14px;
+            transition: 0.3s;
+        }
+
+        .tag.active-bird { background: rgba(0,255,0,0.3); border-color: #0f0; color: #0f0; transform: scale(1.1); }
+        .tag.active-drone { background: rgba(255,0,0,0.3); border-color: #f00; color: #f00; transform: scale(1.1); }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 50;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="container">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="output_canvas"></canvas>
+        
+        <div id="hud">
+            <div class="status-bar">
+                AI VISION SYSTEM<br>
+                FPS: <span id="fps">0</span> | <span id="cam-info">INIT...</span>
+            </div>
+            <div class="indicators">
+                <div id="tag-bird" class="tag">🦅 鸟类</div>
+                <div id="tag-drone" class="tag">🚁 无人机</div>
+            </div>
+        </div>
+        
+        <div id="loading">正在加载模型...<br><small>请确保使用 HTTPS 访问</small></div>
+    </div>
+
+    <script type="module">
+        import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output_canvas");
+        const ctx = canvas.getContext("2d");
+        const loading = document.getElementById("loading");
+        const fpsSpan = document.getElementById("fps");
+        
+        let objectDetector;
+        let lastTime = 0;
+
+        // 1. 初始化模型
+        async function init() {
+            try {
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+                );
+                objectDetector = await ObjectDetector.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite`,
+                        delegate: "GPU" // 手机尽量用 GPU
+                    },
+                    scoreThreshold: 0.45,
+                    runningMode: "VIDEO"
+                });
+                loading.innerText = "请求摄像头权限...";
+                startCamera();
+            } catch (e) {
+                loading.innerText = "模型加载失败: " + e.message;
+            }
+        }
+
+        // 2. 启动摄像头 (适配手机)
+        async function startCamera() {
+            try {
+                const constraints = {
+                    video: {
+                        facingMode: "environment", // 强制后置摄像头
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                };
+
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    video.play();
+                    loading.style.display = 'none';
+                    // 调整 canvas 尺寸匹配视频实际渲染尺寸
+                    resizeCanvas();
+                    loop();
+                };
+            } catch (err) {
+                loading.innerHTML = "摄像头启动失败<br>请检查：<br>1.是否为 HTTPS 链接<br>2.是否允许权限";
+                console.error(err);
+            }
+        }
+
+        function resizeCanvas() {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+        }
+
+        // 3. 循环检测
+        async function loop() {
+            const now = performance.now();
+            fpsSpan.innerText = (1000 / (now - lastTime)).toFixed(0);
+            lastTime = now;
+
+            if (objectDetector && video.readyState >= 2) {
+                const detections = objectDetector.detectForVideo(video, now);
+                draw(detections);
+            }
+            requestAnimationFrame(loop);
+        }
+
+        // 4. 绘制与判断
+        function draw(result) {
+            // 清空并匹配尺寸
+            if(canvas.width !== video.videoWidth) resizeCanvas();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            let hasBird = false;
+            let hasDrone = false;
+
+            for (const d of result.detections) {
+                const name = d.categories[0].categoryName.toLowerCase();
+                const score = (d.categories[0].score * 100).toFixed(0);
+                const box = d.boundingBox;
+
+                let color = null;
+                let label = "";
+
+                if (name === "bird") {
+                    hasBird = true;
+                    color = "#00ff00";
+                    label = `Bird ${score}%`;
+                } else if (name === "airplane") {
+                    hasDrone = true;
+                    color = "#ff0000";
+                    label = `Drone ${score}%`;
+                }
+
+                if (color) {
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(box.originX, box.originY, box.width, box.height);
+                    
+                    ctx.fillStyle = color;
+                    ctx.font = "bold 20px Arial";
+                    ctx.fillText(label, box.originX, box.originY - 10);
+                }
+            }
+
+            // 更新下方标签
+            document.getElementById('tag-bird').className = hasBird ? 'tag active-bird' : 'tag';
+            document.getElementById('tag-drone').className = hasDrone ? 'tag active-drone' : 'tag';
+        }
+
+        init();
+    </script>
+</body>
+</html>
